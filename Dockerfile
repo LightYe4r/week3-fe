@@ -13,7 +13,7 @@ COPY . /usr/share/nginx/html/
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 # config.js 파일을 빌드 타임에 생성
-RUN echo "window.BACKEND_URL = '${BACKEND_URL}';" > /usr/share/nginx/html/config.js
+RUN echo "window.BACKEND_URL = 'https://wjdakstjd.store';" > /usr/share/nginx/html/config.js
 
 # 포트 노출
 EXPOSE 80
