@@ -1,7 +1,7 @@
 FROM nginx:alpine
 
 # 빌드 인자 정의
-ARG BACKEND_URL=http://wjdakstjd.store
+ARG BACKEND_URL=https://wjdakstjd.store
 
 # 기본 nginx 설정 제거
 RUN rm -rf /usr/share/nginx/html/*

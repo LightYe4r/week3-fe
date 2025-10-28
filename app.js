@@ -4,7 +4,7 @@
 const API_URL = window.BACKEND_URL || (
     window.location.hostname === 'localhost' 
         ? 'http://localhost:3000' 
-        : 'http://your-backend-alb-url'
+        : 'https://wjdakstjd.store'
 );
 
 console.log('API URL:', API_URL);
