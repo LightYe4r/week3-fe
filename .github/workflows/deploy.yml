@@ -63,7 +63,7 @@ jobs:
           
           RULE_ARN=$(aws elbv2 describe-rules \
             --listener-arn $LISTENER_ARN \
-            --query 'Rules[?IsDefault==`true`].RuleArn' \
+            --query "Rules[?IsDefault==\`false\` && Conditions[?Field=='path-pattern' && Values[0]=='/*']].RuleArn | [0]" \
             --output text)
           echo "rule_arn=$RULE_ARN" >> $GITHUB_OUTPUT
       
