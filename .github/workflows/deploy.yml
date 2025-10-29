@@ -16,6 +16,7 @@ env:
   ECR_REPOSITORY: msj/fe
   TG_BLUE: msj-tg-fe
   TG_GREEN: msj-tg-fe-g
+  ALB_NAME: msj-alb
 
 jobs:
   deploy:
@@ -45,36 +46,68 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
       
-      - name: Determine current and target environment
+      - name: Get ALB Listener and Rule ARNs
+        id: get-alb-info
+        run: |
+          LB_ARN=$(aws elbv2 describe-load-balancers \
+            --names $ALB_NAME \
+            --query 'LoadBalancers[0].LoadBalancerArn' \
+            --output text)
+          echo "lb_arn=$LB_ARN" >> $GITHUB_OUTPUT
+          
+          LISTENER_ARN=$(aws elbv2 describe-listeners \
+            --load-balancer-arn $LB_ARN \
+            --query 'Listeners[?Port==`443`].ListenerArn' \
+            --output text)
+          echo "listener_arn=$LISTENER_ARN" >> $GITHUB_OUTPUT
+          
+          RULE_ARN=$(aws elbv2 describe-rules \
+            --listener-arn $LISTENER_ARN \
+            --query 'Rules[?IsDefault==`true`].RuleArn' \
+            --output text)
+          echo "rule_arn=$RULE_ARN" >> $GITHUB_OUTPUT
+      
+      - name: Get Target Group ARNs
+        id: get-tg-arns
+        run: |
+          BLUE_TG_ARN=$(aws elbv2 describe-target-groups \
+            --names $TG_BLUE \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text)
+          echo "blue_tg_arn=$BLUE_TG_ARN" >> $GITHUB_OUTPUT
+          
+          GREEN_TG_ARN=$(aws elbv2 describe-target-groups \
+            --names $TG_GREEN \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text)
+          echo "green_tg_arn=$GREEN_TG_ARN" >> $GITHUB_OUTPUT
+      
+      - name: Determine current environment
         id: determine-env
         run: |
-          # 현재 서비스가 사용 중인 Target Group 확인
-          CURRENT_TG=$(aws ecs describe-services \
-            --cluster $ECS_CLUSTER \
-            --services $ECS_SERVICE \
-            --query 'services[0].loadBalancers[0].targetGroupArn' \
-            --output text 2>/dev/null || echo "")
+          CURRENT_WEIGHTS=$(aws elbv2 describe-rules \
+            --rule-arns ${{ steps.get-alb-info.outputs.rule_arn }} \
+            --query 'Rules[0].Actions[0].ForwardConfig.TargetGroups' \
+            --output json)
           
-          echo "Current TG ARN: $CURRENT_TG"
+          BLUE_WEIGHT=$(echo $CURRENT_WEIGHTS | jq -r '.[] | select(.TargetGroupArn | contains("'$TG_BLUE'")) | .Weight')
           
-          # Blue/Green 결정
-          if [[ "$CURRENT_TG" == *"$TG_BLUE"* ]] || [[ -z "$CURRENT_TG" ]]; then
+          if [[ "$BLUE_WEIGHT" == "100" ]] || [[ -z "$BLUE_WEIGHT" ]]; then
             echo "current=blue" >> $GITHUB_OUTPUT
-            echo "target_tg=$TG_GREEN" >> $GITHUB_OUTPUT
-            echo "📘 Current: Blue → Deploying to: 🟢 Green"
+            echo "target=green" >> $GITHUB_OUTPUT
+            echo "📘 Current: Blue (100%) → Deploying to: 🟢 Green"
           else
             echo "current=green" >> $GITHUB_OUTPUT
-            echo "target_tg=$TG_BLUE" >> $GITHUB_OUTPUT
-            echo "🟢 Current: Green → Deploying to: 📘 Blue"
+            echo "target=blue" >> $GITHUB_OUTPUT
+            echo "🟢 Current: Green (100%) → Deploying to: 📘 Blue"
           fi
       
-      - name: Download current task definition
+      - name: Download task definition
         run: |
           aws ecs describe-task-definition \
             --task-definition msj-TD-FE \
             --query taskDefinition > task-def-raw.json
           
-          # 불필요한 필드 제거 (새 revision 등록을 위해)
           cat task-def-raw.json | jq 'del(
             .taskDefinitionArn,
             .requiresAttributes,
@@ -101,44 +134,70 @@ jobs:
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)
           echo "arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
-          echo "✅ Registered new task definition: $TASK_DEF_ARN"
+          echo "✅ New task definition: $TASK_DEF_ARN"
       
       - name: Deploy to target environment
         run: |
-          # Target Group ARN 가져오기
-          TARGET_TG_ARN=$(aws elbv2 describe-target-groups \
-            --names ${{ steps.determine-env.outputs.target_tg }} \
-            --query 'TargetGroups[0].TargetGroupArn' \
-            --output text)
-          
-          echo "Target TG ARN: $TARGET_TG_ARN"
-          
-          # Service 업데이트 (새 Task Definition + 새 Target Group)
           aws ecs update-service \
             --cluster $ECS_CLUSTER \
             --service $ECS_SERVICE \
             --task-definition ${{ steps.register-task-def.outputs.arn }} \
-            --load-balancers targetGroupArn=$TARGET_TG_ARN,containerName=$CONTAINER_NAME,containerPort=80 \
             --force-new-deployment
           
-          echo "🚀 Deployment started to ${{ steps.determine-env.outputs.target_tg }}"
+          echo "🚀 Deployment initiated to ${{ steps.determine-env.outputs.target }}"
       
-      - name: Wait for service stability
+      - name: Wait for new tasks to be healthy
         run: |
-          echo "⏳ Waiting for service to become stable..."
+          echo "⏳ Waiting for service to be stable..."
           aws ecs wait services-stable \
             --cluster $ECS_CLUSTER \
             --services $ECS_SERVICE
-          echo "✅ Service is stable!"
-      
-      - name: Verify deployment
-        run: |
-          echo "🎉 Deployment completed successfully!"
-          echo "Environment: ${{ steps.determine-env.outputs.target_tg }}"
-          echo "Image: ${{ steps.build-image.outputs.image }}"
           
-          # 배포 정보 출력
-          aws ecs describe-services \
-            --cluster $ECS_CLUSTER \
-            --services $ECS_SERVICE \
-            --query 'services[0].{TaskDefinition:taskDefinition,RunningCount:runningCount,DesiredCount:desiredCount,Status:status}'
+          TARGET_TG_ARN=${{ steps.get-tg-arns.outputs.green_tg_arn }}
+          if [[ "${{ steps.determine-env.outputs.target }}" == "blue" ]]; then
+            TARGET_TG_ARN=${{ steps.get-tg-arns.outputs.blue_tg_arn }}
+          fi
+          
+          echo "⏳ Checking target health..."
+          for i in {1..30}; do
+            HEALTHY_COUNT=$(aws elbv2 describe-target-health \
+              --target-group-arn $TARGET_TG_ARN \
+              --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`] | length(@)' \
+              --output text)
+            
+            if [[ "$HEALTHY_COUNT" -gt 0 ]]; then
+              echo "✅ Targets are healthy!"
+              break
+            fi
+            
+            if [[ $i -eq 30 ]]; then
+              echo "❌ Timeout waiting for healthy targets"
+              exit 1
+            fi
+            
+            sleep 10
+          done
+      
+      - name: Switch traffic to new environment
+        run: |
+          echo "🔀 Switching traffic to ${{ steps.determine-env.outputs.target }}..."
+          
+          if [[ "${{ steps.determine-env.outputs.target }}" == "green" ]]; then
+            aws elbv2 modify-rule \
+              --rule-arn ${{ steps.get-alb-info.outputs.rule_arn }} \
+              --actions Type=forward,ForwardConfig="{TargetGroups=[{TargetGroupArn=${{ steps.get-tg-arns.outputs.blue_tg_arn }},Weight=0},{TargetGroupArn=${{ steps.get-tg-arns.outputs.green_tg_arn }},Weight=100}]}"
+            echo "✅ 🟢 Green: 100%, 📘 Blue: 0%"
+          else
+            aws elbv2 modify-rule \
+              --rule-arn ${{ steps.get-alb-info.outputs.rule_arn }} \
+              --actions Type=forward,ForwardConfig="{TargetGroups=[{TargetGroupArn=${{ steps.get-tg-arns.outputs.blue_tg_arn }},Weight=100},{TargetGroupArn=${{ steps.get-tg-arns.outputs.green_tg_arn }},Weight=0}]}"
+            echo "✅ 📘 Blue: 100%, 🟢 Green: 0%"
+          fi
+      
+      - name: Deployment summary
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🎉 Deployment completed!"
+          echo "Environment: ${{ steps.determine-env.outputs.target }}"
+          echo "Image: ${{ steps.build-image.outputs.image }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
