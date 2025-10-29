@@ -1,4 +1,4 @@
-name: Deploy Frontend to ECS
+name: Deploy Frontend (Blue/Green)
 
 on:
   push:
@@ -7,6 +7,15 @@ on:
 permissions:
   id-token: write
   contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECS_CLUSTER: msj-ecs-cluster
+  ECS_SERVICE: msj-TD-FE-service-os60uixm
+  CONTAINER_NAME: frontend
+  ECR_REPOSITORY: msj/fe
+  TG_BLUE: msj-tg-fe
+  TG_GREEN: msj-tg-fe-g
 
 jobs:
   deploy:
@@ -20,27 +29,116 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::286387522454:role/msj-role-github
-          aws-region: ap-northeast-2
+          aws-region: ${{ env.AWS_REGION }}
       
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
       
       - name: Build and push Docker image
+        id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: msj/fe
           IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
       
-      - name: Force ECS deployment
+      - name: Determine current and target environment
+        id: determine-env
         run: |
+          # 현재 서비스가 사용 중인 Target Group 확인
+          CURRENT_TG=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].loadBalancers[0].targetGroupArn' \
+            --output text 2>/dev/null || echo "")
+          
+          echo "Current TG ARN: $CURRENT_TG"
+          
+          # Blue/Green 결정
+          if [[ "$CURRENT_TG" == *"$TG_BLUE"* ]] || [[ -z "$CURRENT_TG" ]]; then
+            echo "current=blue" >> $GITHUB_OUTPUT
+            echo "target_tg=$TG_GREEN" >> $GITHUB_OUTPUT
+            echo "📘 Current: Blue → Deploying to: 🟢 Green"
+          else
+            echo "current=green" >> $GITHUB_OUTPUT
+            echo "target_tg=$TG_BLUE" >> $GITHUB_OUTPUT
+            echo "🟢 Current: Green → Deploying to: 📘 Blue"
+          fi
+      
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition msj-TD-FE \
+            --query taskDefinition > task-def-raw.json
+          
+          # 불필요한 필드 제거 (새 revision 등록을 위해)
+          cat task-def-raw.json | jq 'del(
+            .taskDefinitionArn,
+            .requiresAttributes,
+            .compatibilities,
+            .revision,
+            .status,
+            .registeredAt,
+            .registeredBy
+          )' > task-definition.json
+      
+      - name: Update task definition with new image
+        id: update-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+      
+      - name: Register new task definition
+        id: register-task-def
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://${{ steps.update-task-def.outputs.task-definition }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+          echo "✅ Registered new task definition: $TASK_DEF_ARN"
+      
+      - name: Deploy to target environment
+        run: |
+          # Target Group ARN 가져오기
+          TARGET_TG_ARN=$(aws elbv2 describe-target-groups \
+            --names ${{ steps.determine-env.outputs.target_tg }} \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text)
+          
+          echo "Target TG ARN: $TARGET_TG_ARN"
+          
+          # Service 업데이트 (새 Task Definition + 새 Target Group)
           aws ecs update-service \
-            --cluster msj-ecs-cluster \
-            --service msj-TD-FE-service-os60uixm \
-            --force-new-deployment \
-            --region ap-northeast-2
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --task-definition ${{ steps.register-task-def.outputs.arn }} \
+            --load-balancers targetGroupArn=$TARGET_TG_ARN,containerName=$CONTAINER_NAME,containerPort=80 \
+            --force-new-deployment
+          
+          echo "🚀 Deployment started to ${{ steps.determine-env.outputs.target_tg }}"
+      
+      - name: Wait for service stability
+        run: |
+          echo "⏳ Waiting for service to become stable..."
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE
+          echo "✅ Service is stable!"
+      
+      - name: Verify deployment
+        run: |
+          echo "🎉 Deployment completed successfully!"
+          echo "Environment: ${{ steps.determine-env.outputs.target_tg }}"
+          echo "Image: ${{ steps.build-image.outputs.image }}"
+          
+          # 배포 정보 출력
+          aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].{TaskDefinition:taskDefinition,RunningCount:runningCount,DesiredCount:desiredCount,Status:status}'
