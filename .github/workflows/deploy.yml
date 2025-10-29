@@ -12,7 +12,7 @@ env:
   AWS_REGION: ap-northeast-2
   ECS_CLUSTER: msj-ecs-cluster
   ECS_SERVICE: msj-TD-FE-service-os60uixm
-  CONTAINER_NAME: frontend
+  CONTAINER_NAME: msj-fe
   ECR_REPOSITORY: msj/fe
   TG_BLUE: msj-tg-fe
   TG_GREEN: msj-tg-fe-g
