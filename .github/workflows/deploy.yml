@@ -87,7 +87,7 @@ jobs:
         run: |
           set -e
           TG_JSON=$(aws elbv2 describe-rules \
-            --rule-arns "${{ steps.get-alb-info.outputs.fe_rule_arn }}" \
+            --rule-arns "${{ steps.get-alb-info.outputs.rule_arn }}" \
             --query 'Rules[0].Actions[0].ForwardConfig.TargetGroups' \
             --output json)
 
@@ -149,6 +149,17 @@ jobs:
             --output text)
           echo "arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
           echo "✅ New task definition: $TASK_DEF_ARN"
+          
+      - name: Choose target service
+        id: choose-svc
+        run: |
+          if [[ "${{ steps.determine-env.outputs.target }}" == "green" ]]; then
+            echo "svc=msj-TD-FE-service-green" >> $GITHUB_OUTPUT
+            echo "prev=msj-TD-FE-service-os60uixm" >> $GITHUB_OUTPUT
+          else
+            echo "svc=msj-TD-FE-service-os60uixm" >> $GITHUB_OUTPUT
+            echo "prev=msj-TD-FE-service-green"  >> $GITHUB_OUTPUT
+          fi
       
       - name: Deploy to target environment
         run: |
