@@ -85,20 +85,34 @@ jobs:
       - name: Determine current environment
         id: determine-env
         run: |
-          CURRENT_WEIGHTS=$(aws elbv2 describe-rules \
-            --rule-arns ${{ steps.get-alb-info.outputs.rule_arn }} \
+          set -e
+          TG_JSON=$(aws elbv2 describe-rules \
+            --rule-arns "${{ steps.get-alb-info.outputs.fe_rule_arn }}" \
             --query 'Rules[0].Actions[0].ForwardConfig.TargetGroups' \
             --output json)
-          
-          BLUE_WEIGHT=$(echo $CURRENT_WEIGHTS | jq -r '.[] | select(.TargetGroupArn | contains("'$TG_BLUE'")) | .Weight')
-          
-          if [[ "$BLUE_WEIGHT" == "100" ]] || [[ -z "$BLUE_WEIGHT" ]]; then
-            echo "current=blue" >> $GITHUB_OUTPUT
-            echo "target=green" >> $GITHUB_OUTPUT
+
+          # 규칙이 forward가 아닐 때(null) → 기본값을 BLUE 100%로 간주
+          if [[ "$TG_JSON" == "null" || -z "$TG_JSON" ]]; then
+            echo "current=blue"  >> $GITHUB_OUTPUT
+            echo "target=green"  >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          BLUE_ARN=$(aws elbv2 describe-target-groups \
+            --names "$TG_BLUE" --query 'TargetGroups[0].TargetGroupArn' --output text)
+          GREEN_ARN=$(aws elbv2 describe-target-groups \
+            --names "$TG_GREEN" --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+          BLUE_WEIGHT=$(echo "$TG_JSON"  | jq -r --arg B "$BLUE_ARN"  '.[] | select(.TargetGroupArn==$B)   | .Weight')
+          GREEN_WEIGHT=$(echo "$TG_JSON" | jq -r --arg G "$GREEN_ARN" '.[] | select(.TargetGroupArn==$G)   | .Weight')
+
+          if [[ "$BLUE_WEIGHT" == "100" || -z "$BLUE_WEIGHT" ]]; then
+            echo "current=blue"  >> $GITHUB_OUTPUT
+            echo "target=green"  >> $GITHUB_OUTPUT
             echo "📘 Current: Blue (100%) → Deploying to: 🟢 Green"
           else
             echo "current=green" >> $GITHUB_OUTPUT
-            echo "target=blue" >> $GITHUB_OUTPUT
+            echo "target=blue"   >> $GITHUB_OUTPUT
             echo "🟢 Current: Green (100%) → Deploying to: 📘 Blue"
           fi
       
